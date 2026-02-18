@@ -1,0 +1,241 @@
+package com.dm;
+
+import com.dm.bean.*;
+import com.dm.grouping.strategy.SimpleGroupingStrategy4Rake;
+import com.dm.planning.EnhancedHybridGASolver;
+import com.dm.planning.Optimization4RakeService;
+import com.dm.planning.OptimizationSolverEngine4RakesImpl;
+import com.dm.util.CollectionUtil;
+import com.dm.util.ExcelReader;
+import com.dm.util.ExcelWriter;
+
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+
+public class MainRakeOptimizerFullPlan {
+
+    public static void main(String[] args) {
+        System.out.println("Starting Rake Planning Optimizer...");
+        System.out.println("Working directory: " + System.getProperty("user.dir"));
+
+        GroupingStrategy4Rake strategy = new SimpleGroupingStrategy4Rake();
+        final String basePath = System.getProperty("user.dir") + "/excel/";
+        System.out.println("Excel path: " + basePath);
+
+        ExcelReader excelReader = new ExcelReader();
+
+        // Read input data
+        final LinkedHashMap<Integer, LinkedHashMap<String, Object>> planningData = excelReader
+                .getDataFromFile(basePath + "RakeProjectionPlanner_Input.xlsx", "Planning Parameter");
+
+        final LinkedHashMap<Integer, LinkedHashMap<String, Object>> rakeConstraintData = excelReader
+                .getDataFromFile(basePath + "RakeProjectionPlanner_Input.xlsx", "Rake Constraint");
+
+        final LinkedHashMap<Integer, LinkedHashMap<String, Object>> wagonConstraintData = excelReader
+                .getDataFromFile(basePath + "RakeProjectionPlanner_Input.xlsx", "Wagon Constraint");
+
+        final LinkedHashMap<Integer, LinkedHashMap<String, Object>> widthRangeCombinationsData = excelReader
+                .getDataFromFile(basePath + "RakeProjectionPlanner_Input.xlsx", "Width Range Combinations");
+
+        final LinkedHashMap<Integer, LinkedHashMap<String, Object>> materialData = excelReader
+                .getDataFromFile(basePath + "RakeProjectionPlanner_Input.xlsx", "Material");
+
+        List<OrderWiseMaterial> materials = getOrderWiseMaterialData(materialData);
+
+        // Group materials by location
+        GroupIterator4Rake iterator = strategy.group(materials,
+                (int) Double.parseDouble(planningData.get(2).get("SCENARIO_TYPE").toString()));
+
+        // Use the optimized solver engine
+        Optimization4RakeService service = new EnhancedHybridGASolver();
+        //Optimization4RakeService service = new OptimizationSolverEngine4RakesImpl();
+
+        // Track all outputs
+        List<PlanOutput4RakeDetail<Integer>> allPlanOutputDetails = new LinkedList<>();
+
+        // Track the next available wagon ID across all groups
+        final int[] nextWagonId = {1};
+
+        CollectionUtil.each(iterator, new CollectionUtil.IIterate<List<Group4Rake>>() {
+            private int globalGroupId = 1;
+
+            @Override
+            public void process(List<Group4Rake> groups) {
+                List<Plan4RakeDetail> planParameters = new LinkedList<>();
+
+                // Process each group within the current location
+                for (Group4Rake group : groups) {
+                    System.out.println("Processing group " + globalGroupId + ": " + group);
+
+                    List<PlanParameter4RakeDetail> parameterDetails = getPlanningParameter(
+                            globalGroupId,
+                            getRakeTypeId(rakeConstraintData,
+                                    (int) Double.parseDouble(planningData.get(2).get("RAKE_TYPE_ID").toString())));
+
+                    Plan4RakeDetail planDetail = new Plan4RakeDetail(
+                            planningData.get(2).get("PLAN_ID").toString(),
+                            (int) Double.parseDouble(planningData.get(2).get("SCENARIO_TYPE").toString()),
+                            (int) Double.parseDouble(planningData.get(2).get("RAKE_TYPE_ID").toString()));
+
+                    planDetail.setParameterDetail(parameterDetails);
+                    planDetail.setWagonParameterDetail(getWagonConstraint(wagonConstraintData));
+                    planDetail.setWidthRangeCombinations(getWidthRangeCombinations(widthRangeCombinationsData));
+                    planDetail.setOrderCoilMappingDetails(getMaterialMappingDetail(globalGroupId, group.getMaterials()));
+                    planParameters.add(planDetail);
+
+                    globalGroupId++;
+                }
+
+                // Call the optimization engine for this location group
+                PlanOutput4RakeDetail<Integer> outputDetail = service.callEngine(planParameters);
+
+                // Renumber wagon IDs sequentially across groups
+                renumberWagonIdsSequentially(outputDetail, nextWagonId);
+
+                allPlanOutputDetails.add(outputDetail);
+            }
+        });
+
+        // Write all outputs to Excel
+        ExcelWriter excelWriter = new ExcelWriter();
+        excelWriter.writeWagonOutputPlan(basePath + "RakeProjectionPlanner_Output.xlsx", allPlanOutputDetails);
+        System.out.println("Output written successfully!");
+        System.exit(0);
+    }
+
+    /**
+     * Renumber wagon IDs sequentially across groups
+     */
+    private static void renumberWagonIdsSequentially(PlanOutput4RakeDetail<Integer> outputDetail, int[] nextWagonId) {
+        if (outputDetail == null || outputDetail.getOrderCoilMappingDetails() == null) {
+            return;
+        }
+
+        // Get all unique wagon IDs in this output
+        List<Integer> uniqueWagonIds = outputDetail.getOrderCoilMappingDetails().stream()
+                .map(OrderCoilMapping4RakeDetail::getWagonsId)
+                .distinct()
+                .sorted()
+                .collect(java.util.stream.Collectors.toList());
+
+        System.out.println("Group has " + uniqueWagonIds.size() + " wagons. Current nextWagonId: " + nextWagonId[0]);
+
+        // Create a mapping from old wagon ID to new sequential ID
+        java.util.Map<Integer, Integer> wagonIdMapping = new java.util.HashMap<>();
+        int startingId = nextWagonId[0];
+
+        for (Integer oldWagonId : uniqueWagonIds) {
+            wagonIdMapping.put(oldWagonId, nextWagonId[0]++);
+        }
+
+        // Update all wagon IDs in the output
+        for (OrderCoilMapping4RakeDetail<Integer> detail : outputDetail.getOrderCoilMappingDetails()) {
+            Integer oldWagonId = detail.getWagonsId();
+            Integer newWagonIdValue = wagonIdMapping.get(oldWagonId);
+            if (newWagonIdValue != null) {
+                detail.setWagonsId(newWagonIdValue);
+            }
+        }
+
+        System.out.println("Renumbered group wagons from " + startingId + " to " + (nextWagonId[0] - 1));
+    }
+
+    private static List<OrderCoilMapping4RakeDetail<Integer>> getMaterialMappingDetail(int groupId,
+                                                                                       List<OrderWiseMaterial> materials) {
+        List<OrderCoilMapping4RakeDetail<Integer>> orderCoilMappingDetails = new LinkedList<>();
+        for (OrderWiseMaterial material : materials) {
+            OrderCoilMapping4RakeDetail<Integer> orderCoilDetail = new OrderCoilMapping4RakeDetail<>();
+            orderCoilDetail.setBatchNo(material.getBatchNo());
+            orderCoilDetail.setOrderNo(material.getOrderNo());
+            orderCoilDetail.setOrderLineItem(material.getOrderLineItem());
+            orderCoilDetail.setStockWeight(material.getStockWeight());
+            orderCoilDetail.setStockWidth(material.getStockWidth());
+            orderCoilDetail.setStockLength(material.getStockLength());
+            orderCoilDetail.setLocation(material.getLocation());
+            orderCoilDetail.setGroupId(groupId);
+            orderCoilMappingDetails.add(orderCoilDetail);
+        }
+        return orderCoilMappingDetails;
+    }
+
+    private static List<WagonParameterDetail> getWagonConstraint(
+            LinkedHashMap<Integer, LinkedHashMap<String, Object>> wagonConstraintData) {
+        List<WagonParameterDetail> wagonParameterDetails = new LinkedList<>();
+        for (int key : wagonConstraintData.keySet()) {
+            wagonParameterDetails.add(new WagonParameterDetail(
+                    (int) Double.parseDouble(wagonConstraintData.get(key).get("ID").toString()),
+                    wagonConstraintData.get(key).get("WIDTH_RANGE_NAME").toString(),
+                    Double.parseDouble(wagonConstraintData.get(key).get("WIDTH_MIN_RANGE").toString()),
+                    Double.parseDouble(wagonConstraintData.get(key).get("WIDTH_MAX_RANGE").toString()),
+                    (int) Double.parseDouble(wagonConstraintData.get(key).get("NUMBER_OF_COIL").toString())));
+        }
+        return wagonParameterDetails;
+    }
+
+    private static List<WidthRangeCombinations> getWidthRangeCombinations(
+            LinkedHashMap<Integer, LinkedHashMap<String, Object>> widthRangeCombinationsData) {
+        List<WidthRangeCombinations> rangeCombinations = new LinkedList<>();
+        for (int key : widthRangeCombinationsData.keySet()) {
+            rangeCombinations.add(new WidthRangeCombinations(
+                    (int) Double.parseDouble(widthRangeCombinationsData.get(key).get("ID").toString()),
+                    (int) Double.parseDouble(widthRangeCombinationsData.get(key).get("NARROW").toString()),
+                    (int) Double.parseDouble(widthRangeCombinationsData.get(key).get("WIDER").toString()),
+                    (int) Double.parseDouble(widthRangeCombinationsData.get(key).get("EXTRA").toString()),
+                    widthRangeCombinationsData.get(key).get("REMARK").toString()));
+        }
+        return rangeCombinations;
+    }
+
+    private static List<PlanParameter4RakeDetail> getPlanningParameter(int groupId,
+                                                                       LinkedHashMap<String, Object> rakeConstraintData) {
+        List<PlanParameter4RakeDetail> parameterDetails = new LinkedList<>();
+        try {
+            PlanParameter4RakeDetail parameterDetail = new PlanParameter4RakeDetail();
+            parameterDetail.setGroupId(groupId);
+            parameterDetail.setRakeTypeId((int) Double.parseDouble(rakeConstraintData.get("RAKE_TYPE_ID").toString()));
+            parameterDetail.setRakeTypeName(rakeConstraintData.get("RAKE_TYPE_NAME").toString());
+            parameterDetail.setRakeMinWeight(Double.parseDouble(rakeConstraintData.get("RAKE_MIN_WEIGHT").toString()));
+            parameterDetail.setRakeMaxWeight(Double.parseDouble(rakeConstraintData.get("RAKE_MAX_WEIGHT").toString()));
+            parameterDetail.setTotalCapacity(Double.parseDouble(rakeConstraintData.get("TOTAL_CAPACITY").toString()));
+            parameterDetail.setNoWagons((int) Double.parseDouble(rakeConstraintData.get("NO_WAGONS").toString()));
+            parameterDetails.add(parameterDetail);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+        return parameterDetails;
+    }
+
+    private static LinkedHashMap<String, Object> getRakeTypeId(
+            LinkedHashMap<Integer, LinkedHashMap<String, Object>> rakeConstraintData, int rakeTypeId) {
+        for (LinkedHashMap<String, Object> rakeConstraint : rakeConstraintData.values()) {
+            if (rakeConstraint.containsKey("RAKE_TYPE_ID")
+                    && ((int) Double.parseDouble(rakeConstraint.get("RAKE_TYPE_ID").toString()) == rakeTypeId)) {
+                return rakeConstraint;
+            }
+        }
+        return null;
+    }
+
+    private static List<OrderWiseMaterial> getOrderWiseMaterialData(
+            LinkedHashMap<Integer, LinkedHashMap<String, Object>> materialData) {
+        List<OrderWiseMaterial> materials = new LinkedList<>();
+        for (Integer cnt : materialData.keySet()) {
+            try {
+                LinkedHashMap<String, Object> data = materialData.get(cnt);
+                OrderWiseMaterial material = new OrderWiseMaterial();
+                material.setBatchNo(data.get("BATCH_NUMBER").toString());
+                material.setOrderNo(data.get("ORDER_NUMBER").toString());
+                material.setOrderLineItem(data.get("ORDER_LINE_NUMBER").toString());
+                material.setStockWeight(Double.parseDouble(data.get("STOCK_WEIGHT").toString()));
+                material.setStockWidth(Double.parseDouble(data.get("STOCK_WIDTH").toString()));
+                material.setStockLength(Double.parseDouble(data.get("STOCK_LENGTH").toString()));
+                material.setLocation(data.get("LOCATION").toString());
+                materials.add(material);
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
+        }
+        return materials;
+    }
+}
